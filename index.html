@@ -130,6 +130,16 @@
   #guided-status { min-height: 30px; margin: 10px 0 0; font: 11px/1.45 var(--mono); color: var(--accent); }
   .data-row { display: flex; gap: 6px; margin-top: 8px; }
   .data-row .action-btn { flex: 1; }
+  #panel.dva-focus { width: min(520px, 92vw); }
+  #panel.dva-focus > :not(#mode-dva-controls):not(#drag-handle) { display: none; }
+  .dva-progress { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin: 12px 0; }
+  .dva-progress span { height: 4px; background: var(--line); }
+  .dva-progress span.active, .dva-progress span.done { background: var(--accent); }
+  .dva-readiness { padding: 10px; border: 1px solid var(--line); color: var(--text-dim); font: 11px/1.45 var(--mono); }
+  .dva-readiness.ready { border-color: var(--accent); color: var(--accent); }
+  .dva-responses { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; max-width: 220px; margin: 12px auto; }
+  .dva-responses button { min-height: 36px; }
+  .dva-responses .empty { visibility: hidden; }
 
   #enter-btn {
     width: 100%; background: var(--accent); color: #1a1206; border: none;
@@ -260,21 +270,32 @@
     </div>
 
     <div id="mode-dva-controls" style="display:none">
-      <div class="group">
-        <div class="row"><label>Target distance</label><span class="val" id="val-dva-dist">2.5 m</span></div>
-        <input type="range" id="ctl-dva-dist" min="1.5" max="4" step="0.1" value="2.5" />
-        <div class="row"><label>Head speed window</label><span class="val" id="val-dva-vel">120°/s</span></div>
-        <input type="range" id="ctl-dva-vel" min="80" max="200" step="10" value="120" />
+      <span class="group-label">Dynamic visual acuity · research protocol</span>
+      <h2 id="dva-stage" style="font-size:18px; margin:0 0 5px">Ready to assess</h2>
+      <p id="dva-instruction" class="sub">Practice first, then static acuity, followed by separate rightward and leftward head-movement blocks. This prototype records performance; it does not diagnose vestibular dysfunction.</p>
+      <div class="dva-progress" aria-label="Assessment progress">
+        <span id="dva-step-0" class="active"></span><span id="dva-step-1"></span><span id="dva-step-2"></span><span id="dva-step-3"></span><span id="dva-step-4"></span>
       </div>
-      <div class="group">
-        <span class="group-label">Pacing</span>
-        <div class="toggles">
-          <button class="toggle-btn active" data-metro="on">Metronome on</button>
-          <button class="toggle-btn" data-metro="off">Off</button>
+      <div id="dva-readiness" class="dva-readiness">Ready for practice. Use the arrow keys in preview, or a controller thumbstick in VR.</div>
+      <div class="group" style="margin-top:12px">
+        <div class="row"><label>Dynamic velocity target</label><span class="val">120–180°/s</span></div>
+        <div class="row"><label>Stimulus</label><span class="val">Landolt C · 150 ms</span></div>
+      </div>
+      <div class="guided-actions">
+        <button class="action-btn primary" id="dva-start">Start practice</button>
+        <button class="action-btn" id="dva-reset">Reset assessment</button>
+      </div>
+      <div id="dva-response-panel" style="display:none">
+        <span class="group-label" style="margin-top:14px">Which way is the gap?</span>
+        <div class="dva-responses">
+          <span class="empty"></span><button class="action-btn" data-dva-response="1">↑</button><span class="empty"></span>
+          <button class="action-btn" data-dva-response="2">←</button><span class="empty"></span><button class="action-btn" data-dva-response="0">→</button>
+          <span class="empty"></span><button class="action-btn" data-dva-response="3">↓</button><span class="empty"></span>
         </div>
       </div>
-      <div class="note">Reports a number, not just a drill. First a static baseline (head still), then dynamic: turn your head side-to-side and the optotype flashes only while you're in the speed window. Answer which way the C's gap points — thumbstick or D-pad in VR, arrow keys in preview. The static-vs-dynamic gap is your score.</div>
       <div id="dva-result" class="note" style="display:none; border-left-color: var(--accent);"></div>
+      <button class="action-btn" id="dva-export" style="width:100%; margin-top:8px">Export DVA runs</button>
+      <button class="action-btn" id="dva-back" style="width:100%; margin-top:8px">Back to exercises</button>
     </div>
 
     <div class="group" style="margin-top:18px">
@@ -310,11 +331,11 @@ const state = {
   optokinetic: { density: 10, speed: 0.15, motion: "cw", contrast: "low", fixation: true },
   dva: {
     dist: 2.5,
-    velTarget: 120,      // degrees/sec, center of the acceptance window
-    velTol: 40,          // +/- window
+    velTarget: 150,      // degrees/sec, center of the acceptance window
+    velTol: 30,          // +/- window → 120–180°/s
     metro: true,
     // runtime
-    phase: "idle",       // idle | static | dynamic | done
+    phase: "idle",       // idle | practice | static | dynamic-right | dynamic-left | done
     logMAR: 1.0,         // current staircase level (gap arcmin = 10^logMAR)
     gapDir: 0,           // 0=R,1=U,2=L,3=D
     trialState: "idle",  // static: showing/await ; dynamic: waiting/flash/await
@@ -322,7 +343,11 @@ const state = {
     reversals: [],
     lastDir: 0,          // last staircase step direction (+down/-up)
     staticThreshold: null,
-    dynamicThreshold: null,
+    dynamicThresholds: { right: null, left: null },
+    practiceRemaining: 0,
+    movementDirection: null,
+    trialLog: [],
+    trialStartedAt: 0,
   },
   previewLook: true,
   sessionStart: null,
@@ -416,6 +441,7 @@ function updateGuidedControls() {
 
 function setExerciseMode(mode) {
   state.mode = mode;
+  document.getElementById("panel").classList.toggle("dva-focus", mode === "dva");
   document.querySelectorAll(".mode-btn").forEach(btn => btn.classList.toggle("active", btn.dataset.mode === mode));
   document.getElementById("mode-fixation-controls").style.display = mode === "fixation" ? "" : "none";
   document.getElementById("mode-pursuit-controls").style.display = mode === "pursuit" ? "" : "none";
@@ -423,6 +449,7 @@ function setExerciseMode(mode) {
   document.getElementById("mode-dva-controls").style.display = mode === "dva" ? "" : "none";
   rebuildTarget();
   applyMode();
+  if (mode === "dva" && state.dva.phase === "idle") updateDvaUi();
 }
 
 function configureGentlePhase(mode) {
@@ -702,6 +729,7 @@ function placeOptotype() {
 // ---------- head angular velocity tracking ----------
 let prevYaw = null;
 let headVelDeg = 0; // smoothed |yaw velocity| in deg/s
+let headYawVelDeg = 0; // signed yaw velocity, used to separate right/left DVA blocks
 const _fwd = new THREE.Vector3();
 function updateHeadVelocity(dt) {
   camera.getWorldDirection(_fwd);
@@ -710,8 +738,9 @@ function updateHeadVelocity(dt) {
     let dYaw = yaw - prevYaw;
     while (dYaw > Math.PI) dYaw -= Math.PI * 2;
     while (dYaw < -Math.PI) dYaw += Math.PI * 2;
-    const inst = Math.abs(dYaw) / dt * (180 / Math.PI);
-    headVelDeg = headVelDeg * 0.7 + inst * 0.3; // light smoothing
+    const signedInst = dYaw / dt * (180 / Math.PI);
+    headYawVelDeg = headYawVelDeg * 0.7 + signedInst * 0.3;
+    headVelDeg = Math.abs(headYawVelDeg);
   }
   prevYaw = yaw;
 }
@@ -719,8 +748,72 @@ function updateHeadVelocity(dt) {
 // ---------- DVA staircase / trial engine ----------
 const DVA_STEP = 0.1;          // logMAR per step
 const DVA_MAX_REVERSALS = 6;
+const DVA_MAX_TRIALS_PER_PHASE = 30;
 const DVA_START_LOGMAR = 1.0;  // gap = 10 arcmin (large)
 const DVA_FLOOR = -0.3, DVA_CEIL = 1.3;
+const DVA_STORAGE_KEY = "vestibular-vr-lab-dva-runs-v1";
+
+function saveDvaRun() {
+  const d = state.dva;
+  const run = {
+    schemaVersion: 1, createdAt: new Date().toISOString(), protocol: "dva-directional-v1",
+    velocityWindowDegPerSec: [d.velTarget - d.velTol, d.velTarget + d.velTol],
+    staticLogMAR: d.staticThreshold, dynamicLogMAR: d.dynamicThresholds,
+    trialLog: d.trialLog,
+    eyeTracking: { available: false, integrationStatus: "not connected" },
+  };
+  try {
+    const runs = JSON.parse(localStorage.getItem(DVA_STORAGE_KEY) || "[]");
+    localStorage.setItem(DVA_STORAGE_KEY, JSON.stringify([...runs.slice(-49), run]));
+  } catch (err) { console.warn("Could not save DVA run locally", err); }
+}
+
+function exportDvaRuns() {
+  const runs = JSON.parse(localStorage.getItem(DVA_STORAGE_KEY) || "[]");
+  if (!runs.length) { document.getElementById("dva-readiness").textContent = "No completed DVA runs are saved yet."; return; }
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([JSON.stringify(runs, null, 2)], { type: "application/json" }));
+  link.download = `vestibular-vr-dva-runs-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function dvaPhaseLabel(phase) {
+  return ({ practice: "Practice", static: "Static baseline", "dynamic-right": "Dynamic · rightward", "dynamic-left": "Dynamic · leftward", done: "Results" })[phase] || "Ready to assess";
+}
+
+function updateDvaUi(message) {
+  const d = state.dva;
+  const step = ({ idle: 0, practice: 0, static: 1, "dynamic-right": 2, "dynamic-left": 3, done: 4 })[d.phase] ?? 0;
+  document.getElementById("dva-stage").textContent = dvaPhaseLabel(d.phase);
+  document.getElementById("dva-instruction").textContent = message || "Use arrow keys in preview or a controller thumbstick in VR.";
+  document.getElementById("dva-response-panel").style.display = d.trialState === "await" ? "" : "none";
+  for (let i = 0; i < 5; i++) document.getElementById(`dva-step-${i}`).className = i < step ? "done" : i === step ? "active" : "";
+}
+
+function dvaStartAssessment() {
+  const d = state.dva;
+  d.staticThreshold = null;
+  d.dynamicThresholds = { right: null, left: null };
+  d.trialLog = [];
+  document.getElementById("dva-result").style.display = "none";
+  dvaStartPhase("practice");
+}
+
+function resetDvaAssessment() {
+  const d = state.dva;
+  d.phase = "idle";
+  d.trialState = "idle";
+  d.reversals = [];
+  d.trialLog = [];
+  d.staticThreshold = null;
+  d.dynamicThresholds = { right: null, left: null };
+  optoMesh.visible = false;
+  infoMesh.visible = false;
+  document.getElementById("dva-result").style.display = "none";
+  document.getElementById("dva-readiness").classList.remove("ready");
+  updateDvaUi("Practice first, then static acuity, followed by separate rightward and leftward head-movement blocks. This prototype records performance; it does not diagnose vestibular dysfunction.");
+}
 
 function dvaStartPhase(phase) {
   const d = state.dva;
@@ -728,11 +821,20 @@ function dvaStartPhase(phase) {
   d.logMAR = DVA_START_LOGMAR;
   d.reversals = [];
   d.lastDir = 0;
-  nextTrial(phase === "static");
-  if (phase === "static") {
+  d.trialsInPhase = 0;
+  d.movementDirection = phase === "dynamic-right" ? 1 : phase === "dynamic-left" ? -1 : null;
+  if (phase === "practice") d.practiceRemaining = 4;
+  nextTrial(phase === "practice" || phase === "static");
+  if (phase === "practice") {
+    paintInfo(["Practice — answer with arrows", "Which way is the gap?"]);
+    updateDvaUi("Four untimed practice trials. Learn the response mapping before results are recorded.");
+  } else if (phase === "static") {
     paintInfo(["Static baseline — hold still", "Which way is the gap?"]);
+    updateDvaUi("Head still. Answer each Landolt C orientation; results are recorded from this block onward.");
   } else {
-    paintInfo(["Dynamic — turn your head side to side", "Answer after each flash"]);
+    const side = phase === "dynamic-right" ? "right" : "left";
+    paintInfo([`Dynamic ${side} — turn your head ${side}`, "Flash appears only in the velocity window"]);
+    updateDvaUi(`Move your head ${side}. The target will flash only at 120–180°/s.`);
   }
   infoMesh.visible = true;
 }
@@ -741,20 +843,34 @@ function nextTrial(showNow) {
   const d = state.dva;
   d.gapDir = Math.floor(Math.random() * 4);
   placeOptotype();
-  if (d.phase === "static") {
+  if (d.phase === "static" || d.phase === "practice") {
     d.trialState = "await";
+    d.trialStartedAt = performance.now();
+    d.stimulusVelocity = 0;
     optoMesh.visible = true;
   } else {
     d.trialState = "waiting"; // wait for velocity window
     optoMesh.visible = false;
   }
+  updateDvaUi(d.phase === "static" ? "Head still. Which way is the gap?" : undefined);
 }
 
 function dvaRespond(dir) {
   const d = state.dva;
-  if (d.phase !== "static" && d.phase !== "dynamic") return;
+  if (!["practice", "static", "dynamic-right", "dynamic-left"].includes(d.phase)) return;
   if (d.trialState !== "await") return;
   const correct = dir === d.gapDir;
+  const reactionMs = Math.round(performance.now() - d.trialStartedAt);
+  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), movementDirection: d.movementDirection });
+  d.trialsInPhase += 1;
+  if (d.phase === "practice") {
+    d.practiceRemaining -= 1;
+    optoMesh.visible = false;
+    if (d.practiceRemaining <= 0) setTimeout(() => dvaStartPhase("static"), 600);
+    else setTimeout(() => nextTrial(true), 350);
+    updateDvaUi(`${Math.max(0, d.practiceRemaining)} practice trial${d.practiceRemaining === 1 ? "" : "s"} remaining.`);
+    return;
+  }
   const step = correct ? +1 : -1; // +1 => harder (down in logMAR)
   if (d.lastDir !== 0 && step !== d.lastDir) {
     d.reversals.push(d.logMAR);
@@ -763,8 +879,9 @@ function dvaRespond(dir) {
   d.logMAR += correct ? -DVA_STEP : +DVA_STEP;
   d.logMAR = Math.max(DVA_FLOOR, Math.min(DVA_CEIL, d.logMAR));
   optoMesh.visible = false;
+  updateDvaUi("Preparing the next trial.");
 
-  if (d.reversals.length >= DVA_MAX_REVERSALS) {
+  if (d.reversals.length >= DVA_MAX_REVERSALS || d.trialsInPhase >= DVA_MAX_TRIALS_PER_PHASE) {
     finishPhase();
   } else {
     setTimeout(() => nextTrial(true), 350);
@@ -774,35 +891,42 @@ function dvaRespond(dir) {
 function finishPhase() {
   const d = state.dva;
   const last4 = d.reversals.slice(-4);
-  const threshold = last4.reduce((a, b) => a + b, 0) / last4.length;
+  const threshold = last4.length ? last4.reduce((a, b) => a + b, 0) / last4.length : d.logMAR;
   if (d.phase === "static") {
     d.staticThreshold = threshold;
-    paintInfo(["Baseline done.", "Now the dynamic test →"]);
-    setTimeout(() => dvaStartPhase("dynamic"), 2200);
-  } else {
-    d.dynamicThreshold = threshold;
+    paintInfo(["Baseline complete.", "Next: rightward head movement"]);
+    setTimeout(() => dvaStartPhase("dynamic-right"), 1200);
+  } else if (d.phase === "dynamic-right") {
+    d.dynamicThresholds.right = threshold;
+    paintInfo(["Rightward block complete.", "Next: leftward head movement"]);
+    setTimeout(() => dvaStartPhase("dynamic-left"), 1200);
+  } else if (d.phase === "dynamic-left") {
+    d.dynamicThresholds.left = threshold;
     d.phase = "done";
     optoMesh.visible = false;
-    const loss = (d.dynamicThreshold - d.staticThreshold);
+    const rightLoss = d.dynamicThresholds.right - d.staticThreshold;
+    const leftLoss = d.dynamicThresholds.left - d.staticThreshold;
     paintInfo([
-      `Static ${d.staticThreshold.toFixed(2)}  ·  Dynamic ${d.dynamicThreshold.toFixed(2)} logMAR`,
-      `DVA loss: ${loss >= 0 ? "+" : ""}${loss.toFixed(2)} logMAR`,
+      `Static ${d.staticThreshold.toFixed(2)} logMAR`,
+      `Right ${rightLoss >= 0 ? "+" : ""}${rightLoss.toFixed(2)} · Left ${leftLoss >= 0 ? "+" : ""}${leftLoss.toFixed(2)} logMAR loss`,
     ]);
-    showDvaResultPanel(loss);
+    showDvaResultPanel(rightLoss, leftLoss);
+    saveDvaRun();
+    updateDvaUi("Assessment complete. Review directional results and data quality below.");
   }
 }
 
-function showDvaResultPanel(loss) {
+function showDvaResultPanel(rightLoss, leftLoss) {
   const el = document.getElementById("dva-result");
   const d = state.dva;
+  const valid = d.trialLog.filter(t => t.phase !== "practice").length;
   el.style.display = "block";
   el.innerHTML =
-    `<strong>Last run</strong> · static ${d.staticThreshold.toFixed(2)} logMAR, ` +
-    `dynamic ${d.dynamicThreshold.toFixed(2)} logMAR · ` +
-    `<strong>loss ${loss >= 0 ? "+" : ""}${loss.toFixed(2)}</strong>. ` +
-    `Bigger positive loss = more acuity dropped during head motion (more VOR demand unmet). ` +
-    `Self-test only — uncalibrated to true visual angle, so treat it as a relative track-your-own-progress number.`;
-  console.log("[DVA]", { static: d.staticThreshold, dynamic: d.dynamicThreshold, loss });
+    `<strong>Results</strong><br/>Static: ${d.staticThreshold.toFixed(2)} logMAR<br/>` +
+    `Rightward loss: <strong>${rightLoss >= 0 ? "+" : ""}${rightLoss.toFixed(2)}</strong> logMAR · ` +
+    `Leftward loss: <strong>${leftLoss >= 0 ? "+" : ""}${leftLoss.toFixed(2)}</strong> logMAR<br/>` +
+    `${valid} recorded trials. Treat this as a repeatable research/progress measure, not a diagnostic result.`;
+  console.log("[DVA]", { static: d.staticThreshold, ...d.dynamicThresholds, rightLoss, leftLoss, trials: d.trialLog });
 }
 
 // ---------- mode visibility ----------
@@ -904,29 +1028,37 @@ function metroTick() {
 
 function animateDva(nowMs, dt) {
   const d = state.dva;
-  if (d.phase !== "static" && d.phase !== "dynamic") return;
+  if (!["practice", "static", "dynamic-right", "dynamic-left"].includes(d.phase)) return;
 
-  if (d.phase === "dynamic") {
-    // metronome pacing ~ one tick per 0.6s to cue direction changes
+  if (d.phase === "dynamic-right" || d.phase === "dynamic-left") {
     if (d.metro && nowMs - lastTick > 600) { metroTick(); lastTick = nowMs; }
 
     if (d.trialState === "waiting") {
       const inWindow = headVelDeg >= (d.velTarget - d.velTol) &&
-                       headVelDeg <= (d.velTarget + d.velTol);
+                       headVelDeg <= (d.velTarget + d.velTol) &&
+                       Math.sign(headYawVelDeg || d.movementDirection) === d.movementDirection;
+      const readiness = document.getElementById("dva-readiness");
+      const directionText = d.movementDirection === 1 ? "right" : "left";
+      readiness.classList.toggle("ready", inWindow);
+      readiness.textContent = inWindow
+        ? `Ready — ${Math.round(headVelDeg)}°/s. Flashing now.`
+        : `Move ${directionText}: ${Math.round(headVelDeg)}°/s (target 120–180°/s).`;
       if (inWindow) {
         optoMesh.visible = true;
         d.trialState = "flash";
         d.flashUntil = nowMs + 150; // brief exposure only
+        d.trialStartedAt = nowMs;
+        d.stimulusVelocity = headVelDeg;
       }
     } else if (d.trialState === "flash") {
       if (nowMs >= d.flashUntil) {
         optoMesh.visible = false;
         d.trialState = "await";
         d.awaitSince = nowMs;
+        updateDvaUi("Answer the gap orientation now.");
       }
     } else if (d.trialState === "await") {
-      // if no answer within 4s, re-present (do not penalise)
-      if (nowMs - d.awaitSince > 4000) d.trialState = "waiting";
+      if (nowMs - d.awaitSince > 4000) { d.trialState = "waiting"; updateDvaUi("No response recorded; prepare for the next flash."); }
     }
   }
 }
@@ -973,7 +1105,7 @@ renderer.setAnimationLoop((time) => {
     const mm = String(Math.floor(secs / 60)).padStart(2, "0");
     const ss = String(secs % 60).padStart(2, "0");
     let hud = `${mm}:${ss}`;
-    if (state.mode === "dva" && state.dva.phase === "dynamic") {
+    if (state.mode === "dva" && state.dva.phase.startsWith("dynamic")) {
       hud += `  ·  ${Math.round(headVelDeg)}°/s`;
     }
     document.getElementById("hud-time").textContent = hud;
@@ -1046,16 +1178,11 @@ bindSlider("ctl-amp", "val-amp", v => `${v.toFixed(0)}°`, v => state.pursuit.am
 bindSlider("ctl-pspeed", "val-pspeed", v => v.toFixed(2), v => state.pursuit.speed = v);
 bindSlider("ctl-density", "val-density", v => v.toFixed(0), v => { state.optokinetic.density = v; rebuildOkTexture(); });
 bindSlider("ctl-ospeed", "val-ospeed", v => v.toFixed(2), v => state.optokinetic.speed = v);
-bindSlider("ctl-dva-dist", "val-dva-dist", v => `${v.toFixed(1)} m`, v => state.dva.dist = v);
-bindSlider("ctl-dva-vel", "val-dva-vel", v => `${v.toFixed(0)}°/s`, v => state.dva.velTarget = v);
-
-document.querySelectorAll('[data-metro]').forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll('[data-metro]').forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-    state.dva.metro = btn.dataset.metro === "on";
-  });
-});
+document.getElementById("dva-start").addEventListener("click", dvaStartAssessment);
+document.getElementById("dva-reset").addEventListener("click", resetDvaAssessment);
+document.getElementById("dva-export").addEventListener("click", exportDvaRuns);
+document.getElementById("dva-back").addEventListener("click", () => { resetDvaAssessment(); setExerciseMode("fixation"); });
+document.querySelectorAll("[data-dva-response]").forEach(btn => btn.addEventListener("click", () => dvaRespond(Number(btn.dataset.dvaResponse))));
 
 // ---------- DVA response input (controllers + keyboard) ----------
 // gapDir mapping: 0=Right, 1=Up, 2=Left, 3=Down
@@ -1070,7 +1197,7 @@ function pollControllers() {
 
     // Start the test with any main button while idle
     if (state.mode === "dva" && state.dva.phase === "idle") {
-      if (gp.buttons.some(b => b && b.pressed)) dvaStartPhase("static");
+      if (gp.buttons.some(b => b && b.pressed)) dvaStartAssessment();
     }
 
     // Find the thumbstick axis pair with the largest magnitude
@@ -1098,7 +1225,7 @@ window.addEventListener("keydown", (e) => {
   if ((e.key === "Enter" || e.key === " ") && state.dva.phase === "idle") {
     // ensure the audio context can start from a user gesture
     if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch {} }
-    dvaStartPhase("static");
+    dvaStartAssessment();
     e.preventDefault(); return;
   }
   const map = { ArrowRight: 0, ArrowUp: 1, ArrowLeft: 2, ArrowDown: 3 };
