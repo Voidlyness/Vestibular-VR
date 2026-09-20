@@ -24,7 +24,8 @@
   canvas { display: block; touch-action: none; }
 
   #ui {
-    position: fixed; inset: 0; display: flex; justify-content: center; align-items: center;
+    position: fixed; inset: 0; display: flex; justify-content: flex-start; align-items: flex-start;
+    padding: 22px;
     pointer-events: none; z-index: 10;
   }
   #panel {
@@ -36,6 +37,9 @@
     border: 1px solid var(--line);
     border-radius: 2px;
     padding: 22px 22px 18px;
+  }
+  @media (max-width: 640px) {
+    #ui { padding: 12px; justify-content: center; }
   }
   #panel.hidden { display: none; }
 
@@ -206,22 +210,10 @@
     </div>
 
     <div id="mode-fixation-controls">
-      <div class="group">
-        <div class="row"><label>Target distance</label><span class="val" id="val-dist">2.5 m</span></div>
-        <input type="range" id="ctl-dist" min="1.5" max="4" step="0.1" value="2.5" />
-        <div class="row"><label>Target size</label><span class="val" id="val-size">1.5 cm</span></div>
-        <input type="range" id="ctl-size" min="0.5" max="5" step="0.1" value="1.5" />
-      </div>
-      <div class="note">Keep the target sharp while turning your head left–right, then up–down, then diagonally. Background stays still — the target does too, it just stays fixed in the room.</div>
+      <div class="note">Keep the large, high-contrast target sharp while turning your head left–right, then up–down, then diagonally. The target stays fixed in the room and remains visible beside the control panel.</div>
     </div>
 
     <div id="mode-pursuit-controls" style="display:none">
-      <div class="group">
-        <div class="row"><label>Target distance</label><span class="val" id="val-pdist">2.5 m</span></div>
-        <input type="range" id="ctl-pdist" min="1.5" max="4" step="0.1" value="2.5" />
-        <div class="row"><label>Target size</label><span class="val" id="val-psize">1.5 cm</span></div>
-        <input type="range" id="ctl-psize" min="0.5" max="5" step="0.1" value="1.5" />
-      </div>
       <div class="group">
         <span class="group-label">Path</span>
         <div class="toggles">
@@ -233,7 +225,7 @@
       </div>
       <div class="group">
         <div class="row"><label>Excursion</label><span class="val" id="val-amp">15°</span></div>
-        <input type="range" id="ctl-amp" min="5" max="40" step="1" value="15" />
+        <input type="range" id="ctl-amp" min="5" max="25" step="1" value="15" />
         <div class="row"><label>Speed</label><span class="val" id="val-pspeed">0.4</span></div>
         <input type="range" id="ctl-pspeed" min="0.1" max="2" step="0.05" value="0.4" />
       </div>
@@ -313,8 +305,8 @@ import * as THREE from "three";
 // ---------- state ----------
 const state = {
   mode: "fixation",
-  fixation: { dist: 2.5, size: 1.5 },
-  pursuit:  { path: "horizontal", amp: 15, speed: 0.4, dist: 2.5, size: 1.5 },
+  fixation: {},
+  pursuit:  { path: "horizontal", amp: 15, speed: 0.4 },
   optokinetic: { density: 10, speed: 0.15, motion: "cw", contrast: "low", fixation: true },
   dva: {
     dist: 2.5,
@@ -344,6 +336,11 @@ const state = {
     lastSampleAt: 0,
   },
 };
+
+// Training stimuli are intentionally fixed so the target stays clear and
+// comparable between runs. DVA keeps its own internal test distance.
+const TRAINING_TARGET_DISTANCE = 2.0;
+const TRAINING_TARGET_DIAMETER_METERS = 0.06;
 
 // ---------- session data model ----------
 // v1 deliberately records only local, anonymised session data. Eye tracking is a
@@ -564,8 +561,7 @@ let ringMesh = new THREE.Mesh(new THREE.RingGeometry(0.02, 0.024, 32), ringMat);
 targetGroup.add(targetMesh, ringMesh);
 
 function rebuildTarget() {
-  const sizeCm = state.mode === "pursuit" ? state.pursuit.size : state.fixation.size;
-  const r = Math.max(sizeCm / 100 / 2, 0.004); // cm diameter -> m radius
+  const r = TRAINING_TARGET_DIAMETER_METERS / 2;
   targetMesh.geometry.dispose();
   ringMesh.geometry.dispose();
   targetMesh.geometry = new THREE.CircleGeometry(r, 32);
@@ -833,12 +829,12 @@ let pursuitJumpTimer = 0;
 let pursuitJumpTarget = new THREE.Vector2(0, 0);
 
 function animateFixation() {
-  const d = state.fixation.dist;
+  const d = TRAINING_TARGET_DISTANCE;
   targetGroup.position.set(0, 1.6, -d);
 }
 
 function animatePursuit(t) {
-  const d = state.pursuit.dist;
+  const d = TRAINING_TARGET_DISTANCE;
   const ampRad = (state.pursuit.amp * Math.PI) / 180;
   const sp = state.pursuit.speed;
   let x = 0, y = 0;
@@ -1046,12 +1042,8 @@ function bindSlider(id, valId, fmt, onChange) {
     onChange(parseFloat(el.value));
   });
 }
-bindSlider("ctl-dist", "val-dist", v => `${v.toFixed(1)} m`, v => state.fixation.dist = v);
-bindSlider("ctl-size", "val-size", v => `${v.toFixed(1)} cm`, v => { state.fixation.size = v; rebuildTarget(); });
 bindSlider("ctl-amp", "val-amp", v => `${v.toFixed(0)}°`, v => state.pursuit.amp = v);
 bindSlider("ctl-pspeed", "val-pspeed", v => v.toFixed(2), v => state.pursuit.speed = v);
-bindSlider("ctl-pdist", "val-pdist", v => `${v.toFixed(1)} m`, v => state.pursuit.dist = v);
-bindSlider("ctl-psize", "val-psize", v => `${v.toFixed(1)} cm`, v => { state.pursuit.size = v; rebuildTarget(); });
 bindSlider("ctl-density", "val-density", v => v.toFixed(0), v => { state.optokinetic.density = v; rebuildOkTexture(); });
 bindSlider("ctl-ospeed", "val-ospeed", v => v.toFixed(2), v => state.optokinetic.speed = v);
 bindSlider("ctl-dva-dist", "val-dva-dist", v => `${v.toFixed(1)} m`, v => state.dva.dist = v);
