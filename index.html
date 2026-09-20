@@ -110,6 +110,22 @@
     font-size: 11.5px; color: var(--text-dim); line-height: 1.55; background: #0d1219;
     border-left: 2px solid var(--accent-dim); padding: 9px 11px; margin: 14px 0; border-radius: 1px;
   }
+  .guided-card {
+    background: #0d1219; border: 1px solid var(--line); padding: 12px; margin: 0 0 16px;
+  }
+  .guided-card strong { display: block; font-size: 13px; margin-bottom: 4px; }
+  .guided-card p { margin: 0 0 10px; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; }
+  .guided-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .action-btn {
+    border: 1px solid var(--line); background: transparent; color: var(--text); font: 600 11px var(--mono);
+    padding: 9px 7px; cursor: pointer; border-radius: 2px;
+  }
+  .action-btn.primary { color: #1a1206; background: var(--accent); border-color: var(--accent); }
+  .action-btn.stop { color: #ffc0b4; border-color: #81463b; }
+  .action-btn:disabled { opacity: .45; cursor: not-allowed; }
+  #guided-status { min-height: 30px; margin: 10px 0 0; font: 11px/1.45 var(--mono); color: var(--accent); }
+  .data-row { display: flex; gap: 6px; margin-top: 8px; }
+  .data-row .action-btn { flex: 1; }
 
   #enter-btn {
     width: 100%; background: var(--accent); color: #1a1206; border: none;
@@ -146,8 +162,9 @@
 <body>
 
 <div id="hud">⏱ <span id="hud-time">00:00</span> &nbsp;·&nbsp; <span id="hud-mode">FIXATION</span></div>
-<div id="exit-bar" class="visible">
+<div id="exit-bar">
   <button id="end-btn">End session</button>
+  <button id="pause-btn" style="display:none">Pause</button>
 </div>
 
 <div id="ui">
@@ -160,6 +177,23 @@
     <p class="eyebrow">Self-test prototype — not a medical device</p>
     <h1>Vestibular VR Lab</h1>
     <p class="sub">Gaze-stabilization and optokinetic drills for a headset browser. Built for self-testing — start short, low-amplitude, low-speed, and stop at the first sign of provoked symptoms.</p>
+
+    <div class="guided-card">
+      <span class="group-label">Guided rehabilitation session</span>
+      <strong>Gentle 4¼-minute starter session</strong>
+      <p>Fixation, pursuit, a rest break, low-intensity optokinetic exposure, then fixation. You remain in control: pause or stop whenever symptoms are uncomfortable.</p>
+      <div class="row"><label for="symptom-before">Symptoms before</label><span class="val" id="val-symptom-before">0 / 10</span></div>
+      <input type="range" id="symptom-before" min="0" max="10" step="1" value="0" />
+      <div class="row"><label for="symptom-after">Symptoms now / after</label><span class="val" id="val-symptom-after">0 / 10</span></div>
+      <input type="range" id="symptom-after" min="0" max="10" step="1" value="0" />
+      <div class="guided-actions">
+        <button class="action-btn primary" id="guided-start">Start guided session</button>
+        <button class="action-btn" id="guided-pause" disabled>Pause</button>
+        <button class="action-btn stop" id="guided-stop" disabled>Stop &amp; save</button>
+        <button class="action-btn" id="guided-export">Export session data</button>
+      </div>
+      <div id="guided-status" aria-live="polite">Ready. Start slowly and stop if you feel unwell.</div>
+    </div>
 
     <div class="group">
       <span class="group-label">Exercise</span>
@@ -300,7 +334,203 @@ const state = {
   },
   previewLook: true,
   sessionStart: null,
+  guided: {
+    status: "idle", // idle | running | paused | complete | stopped
+    phaseIndex: -1,
+    phaseStartedAt: 0,
+    pausedAt: 0,
+    totalPausedMs: 0,
+    record: null,
+    lastSampleAt: 0,
+  },
 };
+
+// ---------- session data model ----------
+// v1 deliberately records only local, anonymised session data. Eye tracking is a
+// future hardware integration point: do not infer clinical measures until the
+// device API, calibration process, and protocol have been validated.
+const SESSION_STORAGE_KEY = "vestibular-vr-lab-sessions-v1";
+const GUIDED_PROTOCOL = [
+  { mode: "fixation", durationMs: 60000, label: "Fixation · gentle head turns" },
+  { mode: "pursuit", durationMs: 60000, label: "Pursuit · eyes only" },
+  { mode: "rest", durationMs: 30000, label: "Rest · breathe and settle" },
+  { mode: "optokinetic", durationMs: 45000, label: "Optokinetic · low intensity" },
+  { mode: "fixation", durationMs: 60000, label: "Fixation · finish gently" },
+];
+
+const guidedStatusEl = document.getElementById("guided-status");
+const guidedStartBtn = document.getElementById("guided-start");
+const guidedPauseBtn = document.getElementById("guided-pause");
+const guidedStopBtn = document.getElementById("guided-stop");
+const pauseBtn = document.getElementById("pause-btn");
+
+function newSessionRecord() {
+  return {
+    schemaVersion: 1,
+    id: globalThis.crypto?.randomUUID?.() || `session-${Date.now()}`,
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    outcome: null,
+    protocol: "gentle-starter-v1",
+    symptoms: {
+      before: Number(document.getElementById("symptom-before").value),
+      after: null,
+    },
+    device: { userAgent: navigator.userAgent, xrActive: renderer?.xr?.isPresenting || false },
+    settings: JSON.parse(JSON.stringify({
+      fixation: state.fixation, pursuit: state.pursuit, optokinetic: state.optokinetic, dva: state.dva,
+    })),
+    events: [],
+    headMotion: { sampleRateHz: 2, samples: [] },
+    eyeTracking: {
+      available: false,
+      integrationStatus: "not connected",
+      futureSampleFields: ["timestampMs", "leftGaze", "rightGaze", "validity", "confidence"],
+      samples: [],
+    },
+  };
+}
+
+function addSessionEvent(type, detail = {}) {
+  const record = state.guided.record;
+  if (!record) return;
+  record.events.push({ elapsedMs: Math.round(performance.now() - state.guided.phaseStartedAt), type, ...detail });
+}
+
+function saveSessionRecord(record) {
+  try {
+    const existing = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || "[]");
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify([...existing.slice(-49), record]));
+  } catch (err) {
+    console.warn("Could not save session locally", err);
+  }
+}
+
+function updateGuidedControls() {
+  const running = state.guided.status === "running";
+  const paused = state.guided.status === "paused";
+  guidedStartBtn.disabled = running || paused;
+  guidedPauseBtn.disabled = !(running || paused);
+  guidedPauseBtn.textContent = paused ? "Resume" : "Pause";
+  guidedStopBtn.disabled = !(running || paused);
+  pauseBtn.style.display = (running || paused) ? "" : "none";
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
+}
+
+function setExerciseMode(mode) {
+  state.mode = mode;
+  document.querySelectorAll(".mode-btn").forEach(btn => btn.classList.toggle("active", btn.dataset.mode === mode));
+  document.getElementById("mode-fixation-controls").style.display = mode === "fixation" ? "" : "none";
+  document.getElementById("mode-pursuit-controls").style.display = mode === "pursuit" ? "" : "none";
+  document.getElementById("mode-optokinetic-controls").style.display = mode === "optokinetic" ? "" : "none";
+  document.getElementById("mode-dva-controls").style.display = mode === "dva" ? "" : "none";
+  rebuildTarget();
+  applyMode();
+}
+
+function configureGentlePhase(mode) {
+  if (mode === "pursuit") {
+    state.pursuit.path = "horizontal"; state.pursuit.amp = 10; state.pursuit.speed = 0.25;
+  }
+  if (mode === "optokinetic") {
+    state.optokinetic.density = 6; state.optokinetic.speed = 0.05;
+    state.optokinetic.motion = "cw"; state.optokinetic.contrast = "low"; state.optokinetic.fixation = true;
+    rebuildOkTexture();
+  }
+}
+
+function beginGuidedPhase(nowMs) {
+  const phase = GUIDED_PROTOCOL[state.guided.phaseIndex];
+  state.guided.phaseStartedAt = nowMs;
+  if (phase.mode !== "rest") {
+    configureGentlePhase(phase.mode);
+    setExerciseMode(phase.mode);
+  } else {
+    state.mode = "rest";
+    applyMode();
+  }
+  addSessionEvent("phase_started", { phase: state.guided.phaseIndex, mode: phase.mode, label: phase.label });
+  guidedStatusEl.textContent = `${phase.label} — ${Math.round(phase.durationMs / 1000)} seconds. Pause or stop at any time.`;
+}
+
+function startGuidedSession() {
+  if (state.guided.status === "running" || state.guided.status === "paused") return;
+  state.guided.status = "running";
+  state.guided.phaseIndex = 0;
+  state.guided.totalPausedMs = 0;
+  state.guided.lastSampleAt = 0;
+  state.guided.record = newSessionRecord();
+  state.guided.record.events.push({ elapsedMs: 0, type: "session_started" });
+  beginGuidedPhase(performance.now());
+  updateGuidedControls();
+}
+
+function finishGuidedSession(outcome) {
+  const record = state.guided.record;
+  if (!record) return;
+  record.endedAt = new Date().toISOString();
+  record.outcome = outcome;
+  record.symptoms.after = Number(document.getElementById("symptom-after").value);
+  record.events.push({ elapsedMs: null, type: "session_finished", outcome });
+  saveSessionRecord(record);
+  state.guided.status = outcome;
+  state.guided.record = null;
+  state.mode = "fixation";
+  applyMode();
+  const text = outcome === "complete" ? "Session saved locally. Review how you feel before doing more." : "Session stopped and saved locally.";
+  guidedStatusEl.textContent = `${text} Use Export session data to download your records.`;
+  updateGuidedControls();
+}
+
+function toggleGuidedPause() {
+  const now = performance.now();
+  if (state.guided.status === "running") {
+    state.guided.status = "paused";
+    state.guided.pausedAt = now;
+    addSessionEvent("paused");
+    guidedStatusEl.textContent = "Paused. Resume only when you feel ready, or stop and save this session.";
+  } else if (state.guided.status === "paused") {
+    state.guided.status = "running";
+    state.guided.phaseStartedAt += now - state.guided.pausedAt;
+    state.guided.totalPausedMs += now - state.guided.pausedAt;
+    addSessionEvent("resumed");
+  }
+  updateGuidedControls();
+}
+
+function stopGuidedSession() {
+  if (state.guided.status === "running" || state.guided.status === "paused") finishGuidedSession("stopped");
+}
+
+function updateGuidedSession(nowMs) {
+  if (state.guided.status !== "running") return;
+  const phase = GUIDED_PROTOCOL[state.guided.phaseIndex];
+  const remaining = Math.max(0, phase.durationMs - (nowMs - state.guided.phaseStartedAt));
+  guidedStatusEl.textContent = `${phase.label} — ${Math.ceil(remaining / 1000)}s remaining. Pause or stop at any time.`;
+  if (nowMs - state.guided.lastSampleAt >= 500) {
+    state.guided.lastSampleAt = nowMs;
+    const q = camera.quaternion;
+    state.guided.record.headMotion.samples.push({
+      timestampMs: Math.round(nowMs), angularVelocityDegPerSec: Math.round(headVelDeg),
+      orientation: { x: Number(q.x.toFixed(4)), y: Number(q.y.toFixed(4)), z: Number(q.z.toFixed(4)), w: Number(q.w.toFixed(4)) },
+    });
+  }
+  if (remaining > 0) return;
+  state.guided.phaseIndex += 1;
+  if (state.guided.phaseIndex >= GUIDED_PROTOCOL.length) finishGuidedSession("complete");
+  else beginGuidedPhase(nowMs);
+}
+
+function exportSessionData() {
+  const sessions = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || "[]");
+  if (!sessions.length) { guidedStatusEl.textContent = "No saved sessions yet."; return; }
+  const blob = new Blob([JSON.stringify(sessions, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `vestibular-vr-sessions-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
 
 // ---------- three.js setup ----------
 const canvas = document.getElementById("canvas");
@@ -592,7 +822,8 @@ function applyMode() {
   document.getElementById("hud-mode").textContent =
     state.mode === "fixation" ? "FIXATION · VOR×1" :
     state.mode === "pursuit" ? "PURSUIT / SACCADE" :
-    state.mode === "optokinetic" ? "OPTOKINETIC" : "DVA TEST";
+    state.mode === "optokinetic" ? "OPTOKINETIC" :
+    state.mode === "dva" ? "DVA TEST" : "REST";
 }
 applyMode();
 
@@ -731,6 +962,7 @@ renderer.setAnimationLoop((time) => {
 
   updateHeadVelocity(dt);
   pollControllers();
+  updateGuidedSession(time);
 
   if (state.mode === "fixation") animateFixation();
   else if (state.mode === "pursuit") animatePursuit(t);
@@ -761,17 +993,19 @@ window.addEventListener("resize", () => {
 // ---------- UI wiring ----------
 document.querySelectorAll(".mode-btn").forEach(btn => {
   btn.addEventListener("click", () => {
-    document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-    state.mode = btn.dataset.mode;
-    document.getElementById("mode-fixation-controls").style.display = state.mode === "fixation" ? "" : "none";
-    document.getElementById("mode-pursuit-controls").style.display = state.mode === "pursuit" ? "" : "none";
-    document.getElementById("mode-optokinetic-controls").style.display = state.mode === "optokinetic" ? "" : "none";
-    document.getElementById("mode-dva-controls").style.display = state.mode === "dva" ? "" : "none";
-    rebuildTarget();
-    applyMode();
+    if (state.guided.status === "running" || state.guided.status === "paused") return;
+    setExerciseMode(btn.dataset.mode);
   });
 });
+
+bindSlider("symptom-before", "val-symptom-before", v => `${v.toFixed(0)} / 10`, () => {});
+bindSlider("symptom-after", "val-symptom-after", v => `${v.toFixed(0)} / 10`, () => {});
+guidedStartBtn.addEventListener("click", startGuidedSession);
+guidedPauseBtn.addEventListener("click", toggleGuidedPause);
+guidedStopBtn.addEventListener("click", stopGuidedSession);
+document.getElementById("guided-export").addEventListener("click", exportSessionData);
+pauseBtn.addEventListener("click", toggleGuidedPause);
+updateGuidedControls();
 
 document.querySelectorAll('[data-path]').forEach(btn => {
   btn.addEventListener("click", () => {
@@ -967,6 +1201,7 @@ enterBtn.addEventListener("click", async () => {
 });
 
 document.getElementById("end-btn").addEventListener("click", () => {
+  stopGuidedSession();
   const session = renderer.xr.getSession();
   if (session) session.end();
 });
