@@ -276,7 +276,7 @@
       <div class="dva-progress" aria-label="Assessment progress">
         <span id="dva-step-0" class="active"></span><span id="dva-step-1"></span><span id="dva-step-2"></span><span id="dva-step-3"></span><span id="dva-step-4"></span>
       </div>
-      <div id="dva-readiness" class="dva-readiness">Ready for practice. Use the arrow keys in preview, or a controller thumbstick in VR.</div>
+      <div id="dva-readiness" class="dva-readiness">Ready for practice. Use arrows or the response buttons; “I can’t see the gap” is always valid.</div>
       <div class="group" style="margin-top:12px">
         <div class="row"><label>Dynamic velocity target</label><span class="val">120–180°/s</span></div>
         <div class="row"><label>Stimulus</label><span class="val">Landolt C · 150 ms</span></div>
@@ -292,6 +292,7 @@
           <button class="action-btn" data-dva-response="2">←</button><span class="empty"></span><button class="action-btn" data-dva-response="0">→</button>
           <span class="empty"></span><button class="action-btn" data-dva-response="3">↓</button><span class="empty"></span>
         </div>
+        <button class="action-btn stop" id="dva-not-seen" style="width:100%">I can’t see the gap</button>
       </div>
       <div id="dva-result" class="note" style="display:none; border-left-color: var(--accent);"></div>
       <button class="action-btn" id="dva-export" style="width:100%; margin-top:8px">Export DVA runs</button>
@@ -786,7 +787,7 @@ function updateDvaUi(message) {
   const d = state.dva;
   const step = ({ idle: 0, practice: 0, static: 1, "dynamic-right": 2, "dynamic-left": 3, done: 4 })[d.phase] ?? 0;
   document.getElementById("dva-stage").textContent = dvaPhaseLabel(d.phase);
-  document.getElementById("dva-instruction").textContent = message || "Use arrow keys in preview or a controller thumbstick in VR.";
+  document.getElementById("dva-instruction").textContent = message || "Use arrows or response buttons in preview; use a thumbstick in VR. Press X in preview or B/Y in VR if the gap is not visible.";
   document.getElementById("dva-response-panel").style.display = d.trialState === "await" ? "" : "none";
   for (let i = 0; i < 5; i++) document.getElementById(`dva-step-${i}`).className = i < step ? "done" : i === step ? "active" : "";
 }
@@ -855,13 +856,13 @@ function nextTrial(showNow) {
   updateDvaUi(d.phase === "static" ? "Head still. Which way is the gap?" : undefined);
 }
 
-function dvaRespond(dir) {
+function dvaRespond(dir, responseType = "direction") {
   const d = state.dva;
   if (!["practice", "static", "dynamic-right", "dynamic-left"].includes(d.phase)) return;
   if (d.trialState !== "await") return;
-  const correct = dir === d.gapDir;
+  const correct = responseType === "direction" && dir === d.gapDir;
   const reactionMs = Math.round(performance.now() - d.trialStartedAt);
-  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), movementDirection: d.movementDirection });
+  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, responseType, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), movementDirection: d.movementDirection });
   d.trialsInPhase += 1;
   if (d.phase === "practice") {
     d.practiceRemaining -= 1;
@@ -1183,10 +1184,12 @@ document.getElementById("dva-reset").addEventListener("click", resetDvaAssessmen
 document.getElementById("dva-export").addEventListener("click", exportDvaRuns);
 document.getElementById("dva-back").addEventListener("click", () => { resetDvaAssessment(); setExerciseMode("fixation"); });
 document.querySelectorAll("[data-dva-response]").forEach(btn => btn.addEventListener("click", () => dvaRespond(Number(btn.dataset.dvaResponse))));
+document.getElementById("dva-not-seen").addEventListener("click", () => dvaRespond(null, "not_seen"));
 
 // ---------- DVA response input (controllers + keyboard) ----------
 // gapDir mapping: 0=Right, 1=Up, 2=Left, 3=Down
 let stickReleased = true;
+let notSeenReleased = true;
 function pollControllers() {
   if (!renderer.xr.isPresenting) return;
   const session = renderer.xr.getSession();
@@ -1198,7 +1201,13 @@ function pollControllers() {
     // Start the test with any main button while idle
     if (state.mode === "dva" && state.dva.phase === "idle") {
       if (gp.buttons.some(b => b && b.pressed)) dvaStartAssessment();
+      continue;
     }
+
+    // Secondary controller button (normally B/Y) records an explicit "not seen"
+    // response without requiring a directional guess.
+    if (!gp.buttons[1]?.pressed) notSeenReleased = true;
+    else if (notSeenReleased) { notSeenReleased = false; dvaRespond(null, "not_seen"); }
 
     // Find the thumbstick axis pair with the largest magnitude
     const ax = gp.axes || [];
@@ -1229,6 +1238,7 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault(); return;
   }
   const map = { ArrowRight: 0, ArrowUp: 1, ArrowLeft: 2, ArrowDown: 3 };
+  if (e.key.toLowerCase() === "x") { dvaRespond(null, "not_seen"); e.preventDefault(); return; }
   if (e.key in map) { dvaRespond(map[e.key]); e.preventDefault(); }
 });
 
