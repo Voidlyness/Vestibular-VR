@@ -281,6 +281,10 @@
         <div class="row"><label>Dynamic velocity target</label><span class="val">120–180°/s</span></div>
         <div class="row"><label>Stimulus</label><span class="val">Landolt C · 150 ms</span></div>
       </div>
+      <div id="dva-before-panel" class="group">
+        <div class="row"><label for="dva-symptom-before">Symptoms before</label><span class="val" id="val-dva-symptom-before">0 / 10</span></div>
+        <input type="range" id="dva-symptom-before" min="0" max="10" step="1" value="0" />
+      </div>
       <div class="guided-actions">
         <button class="action-btn primary" id="dva-start">Start practice</button>
         <button class="action-btn" id="dva-reset">Reset assessment</button>
@@ -294,7 +298,19 @@
         </div>
         <button class="action-btn stop" id="dva-not-seen" style="width:100%">I can’t see the gap</button>
       </div>
+      <div id="dva-rest-panel" style="display:none">
+        <div class="note">Rest before the leftward block. Continue only when any dizziness has settled. In VR: A/trigger continues, B/Y stops.</div>
+        <div class="guided-actions">
+          <button class="action-btn primary" id="dva-continue">Continue to leftward block</button>
+          <button class="action-btn stop" id="dva-stop">Stop &amp; save</button>
+        </div>
+      </div>
       <div id="dva-result" class="note" style="display:none; border-left-color: var(--accent);"></div>
+      <div id="dva-after-panel" class="group" style="display:none">
+        <div class="row"><label for="dva-symptom-after">Symptoms now</label><span class="val" id="val-dva-symptom-after">0 / 10</span></div>
+        <input type="range" id="dva-symptom-after" min="0" max="10" step="1" value="0" />
+        <button class="action-btn primary" id="dva-save-after" style="width:100%; margin-top:8px">Save symptom rating</button>
+      </div>
       <button class="action-btn" id="dva-export" style="width:100%; margin-top:8px">Export DVA runs</button>
       <button class="action-btn" id="dva-back" style="width:100%; margin-top:8px">Back to exercises</button>
     </div>
@@ -767,7 +783,9 @@ function optotypeGazeOffsetDeg() {
 // ---------- DVA staircase / trial engine ----------
 const DVA_STEP = 0.1;          // logMAR per step
 const DVA_MAX_REVERSALS = 6;
-const DVA_MAX_TRIALS_PER_PHASE = 30;
+// Staircase: 1-down/1-up until the first reversal for a quick approach, then
+// 2-down/1-up, which converges on ~71% correct (4AFC chance is 25%).
+const DVA_MAX_TRIALS_PER_PHASE = 40;
 const DVA_START_LOGMAR = 1.0;  // gap = 10 arcmin (large)
 const DVA_FLOOR = -0.3, DVA_CEIL = 1.3;
 // Only flash when the head points close to the optotype, so it is actually in view.
@@ -775,13 +793,17 @@ const DVA_FLOOR = -0.3, DVA_CEIL = 1.3;
 const DVA_MAX_YAW_OFFSET_DEG = 10;
 const DVA_MAX_PITCH_OFFSET_DEG = 15;
 const DVA_RESPONSE_TIMEOUT_MS = 4000;
+const DVA_STAIRCASE = "1-down/1-up to first reversal, then 2-down/1-up; 0.1 logMAR steps; threshold = mean of last 4 of 6 reversals";
 const DVA_STORAGE_KEY = "vestibular-vr-lab-dva-runs-v1";
 
-function saveDvaRun() {
+function saveDvaRun(outcome) {
   const d = state.dva;
+  d.runId = globalThis.crypto?.randomUUID?.() || `dva-${Date.now()}`;
   const run = {
-    schemaVersion: 1, createdAt: new Date().toISOString(), protocol: "dva-directional-v1",
+    schemaVersion: 2, id: d.runId, createdAt: new Date().toISOString(), protocol: "dva-directional-v2",
+    outcome, staircase: DVA_STAIRCASE,
     velocityWindowDegPerSec: [d.velTarget - d.velTol, d.velTarget + d.velTol],
+    symptoms: { before: d.symptomsBefore, after: null },
     staticLogMAR: d.staticThreshold, dynamicLogMAR: d.dynamicThresholds,
     trialLog: d.trialLog,
     eyeTracking: { available: false, integrationStatus: "not connected" },
@@ -790,6 +812,19 @@ function saveDvaRun() {
     const runs = JSON.parse(localStorage.getItem(DVA_STORAGE_KEY) || "[]");
     localStorage.setItem(DVA_STORAGE_KEY, JSON.stringify([...runs.slice(-49), run]));
   } catch (err) { console.warn("Could not save DVA run locally", err); }
+}
+
+function saveDvaSymptomsAfter() {
+  const d = state.dva;
+  if (!d.runId) return;
+  const after = Number(document.getElementById("dva-symptom-after").value);
+  try {
+    const runs = JSON.parse(localStorage.getItem(DVA_STORAGE_KEY) || "[]");
+    const run = runs.find(r => r.id === d.runId);
+    if (run) { run.symptoms.after = after; localStorage.setItem(DVA_STORAGE_KEY, JSON.stringify(runs)); }
+  } catch (err) { console.warn("Could not update DVA run", err); }
+  d.symptomsAfterSaved = true;
+  updateDvaUi(`Symptom rating saved (${after} / 10). If symptoms are higher than before, rest before doing more.`);
 }
 
 function exportDvaRuns() {
@@ -803,15 +838,19 @@ function exportDvaRuns() {
 }
 
 function dvaPhaseLabel(phase) {
-  return ({ practice: "Practice", static: "Static baseline", "dynamic-right": "Dynamic · rightward", "dynamic-left": "Dynamic · leftward", done: "Results" })[phase] || "Ready to assess";
+  return ({ practice: "Practice", static: "Static baseline", "dynamic-right": "Dynamic · rightward", rest: "Rest break", "dynamic-left": "Dynamic · leftward", done: "Results", stopped: "Stopped" })[phase] || "Ready to assess";
 }
 
 function updateDvaUi(message) {
   const d = state.dva;
-  const step = ({ idle: 0, practice: 0, static: 1, "dynamic-right": 2, "dynamic-left": 3, done: 4 })[d.phase] ?? 0;
+  const step = ({ idle: 0, practice: 0, static: 1, "dynamic-right": 2, rest: 3, "dynamic-left": 3, done: 4, stopped: 4 })[d.phase] ?? 0;
   document.getElementById("dva-stage").textContent = dvaPhaseLabel(d.phase);
   document.getElementById("dva-instruction").textContent = message || "Use arrows or response buttons in preview; use a thumbstick in VR. Press X in preview or B/Y in VR if the gap is not visible.";
   document.getElementById("dva-response-panel").style.display = d.trialState === "await" ? "" : "none";
+  document.getElementById("dva-before-panel").style.display = d.phase === "idle" ? "" : "none";
+  document.getElementById("dva-rest-panel").style.display = d.phase === "rest" ? "" : "none";
+  document.getElementById("dva-after-panel").style.display =
+    (d.phase === "done" || d.phase === "stopped") && d.runId && !d.symptomsAfterSaved ? "" : "none";
   for (let i = 0; i < 5; i++) document.getElementById(`dva-step-${i}`).className = i < step ? "done" : i === step ? "active" : "";
 }
 
@@ -833,6 +872,9 @@ function dvaStartAssessment() {
   d.staticThreshold = null;
   d.dynamicThresholds = { right: null, left: null };
   d.trialLog = [];
+  d.symptomsBefore = Number(document.getElementById("dva-symptom-before").value);
+  d.runId = null;
+  d.symptomsAfterSaved = false;
   document.getElementById("dva-result").style.display = "none";
   dvaStartPhase("practice");
 }
@@ -846,6 +888,8 @@ function resetDvaAssessment() {
   d.trialLog = [];
   d.staticThreshold = null;
   d.dynamicThresholds = { right: null, left: null };
+  d.runId = null;
+  d.symptomsAfterSaved = false;
   optoMesh.visible = false;
   infoMesh.visible = false;
   document.getElementById("dva-result").style.display = "none";
@@ -859,6 +903,7 @@ function dvaStartPhase(phase) {
   d.logMAR = DVA_START_LOGMAR;
   d.reversals = [];
   d.lastDir = 0;
+  d.correctStreak = 0;
   d.trialsInPhase = 0;
   d.movementDirection = phase === "dynamic-right" ? 1 : phase === "dynamic-left" ? -1 : null;
   if (phase === "practice") d.practiceRemaining = 4;
@@ -910,13 +955,20 @@ function dvaRespond(dir, responseType = "direction") {
     updateDvaUi(`${Math.max(0, d.practiceRemaining)} practice trial${d.practiceRemaining === 1 ? "" : "s"} remaining.`);
     return;
   }
-  const step = correct ? +1 : -1; // +1 => harder (down in logMAR)
-  if (d.lastDir !== 0 && step !== d.lastDir) {
-    d.reversals.push(d.logMAR);
+  let step = 0; // +1 => harder (down in logMAR), -1 => easier
+  if (correct) {
+    d.correctStreak += 1;
+    if (d.reversals.length === 0 || d.correctStreak >= 2) { step = +1; d.correctStreak = 0; }
+  } else {
+    d.correctStreak = 0;
+    step = -1;
   }
-  d.lastDir = step;
-  d.logMAR += correct ? -DVA_STEP : +DVA_STEP;
-  d.logMAR = Math.max(DVA_FLOOR, Math.min(DVA_CEIL, d.logMAR));
+  if (step !== 0) {
+    if (d.lastDir !== 0 && step !== d.lastDir) d.reversals.push(d.logMAR);
+    d.lastDir = step;
+    d.logMAR = Math.round((d.logMAR - step * DVA_STEP) * 100) / 100;
+    d.logMAR = Math.max(DVA_FLOOR, Math.min(DVA_CEIL, d.logMAR));
+  }
   optoMesh.visible = false;
   updateDvaUi("Preparing the next trial.");
 
@@ -927,12 +979,12 @@ function dvaRespond(dir, responseType = "direction") {
   }
 }
 
-// No answer within the response window. Logged and counted towards the phase
-// trial cap (so the block always ends) but not fed to the staircase.
 function roundedOffset(o) {
   return o ? { yaw: Number(o.yaw.toFixed(1)), pitch: Number(o.pitch.toFixed(1)) } : null;
 }
 
+// No answer within the response window. Logged and counted towards the phase
+// trial cap (so the block always ends) but not fed to the staircase.
 function dvaTimeout() {
   const d = state.dva;
   d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: null, responseType: "timeout", correct: null, reactionMs: null, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), stimulusGazeOffsetDeg: roundedOffset(d.stimulusOffset), movementDirection: d.movementDirection });
@@ -953,8 +1005,7 @@ function finishPhase() {
     dvaSchedule(() => dvaStartPhase("dynamic-right"), 1200);
   } else if (d.phase === "dynamic-right") {
     d.dynamicThresholds.right = threshold;
-    paintInfo(["Rightward block complete.", "Next: leftward head movement"]);
-    dvaSchedule(() => dvaStartPhase("dynamic-left"), 1200);
+    dvaStartRest();
   } else if (d.phase === "dynamic-left") {
     d.dynamicThresholds.left = threshold;
     d.phase = "done";
@@ -966,9 +1017,39 @@ function finishPhase() {
       `Right ${rightLoss >= 0 ? "+" : ""}${rightLoss.toFixed(2)} · Left ${leftLoss >= 0 ? "+" : ""}${leftLoss.toFixed(2)} logMAR loss`,
     ]);
     showDvaResultPanel(rightLoss, leftLoss);
-    saveDvaRun();
-    updateDvaUi("Assessment complete. Review directional results and data quality below.");
+    saveDvaRun("complete");
+    updateDvaUi("Assessment complete. Rate how you feel now, then review the results below.");
   }
+}
+
+// Rest break between the two provoking dynamic blocks; the user decides when to go on.
+function dvaStartRest() {
+  const d = state.dva;
+  d.phase = "rest";
+  d.trialState = "idle";
+  optoMesh.visible = false;
+  paintInfo(["Rightward block complete — rest.", "A/trigger: continue · B/Y: stop"]);
+  infoMesh.visible = true;
+  updateDvaUi("Rest. Continue to the leftward block only when any dizziness has settled, or stop and save.");
+}
+
+function dvaContinueFromRest() {
+  if (state.dva.phase === "rest") dvaStartPhase("dynamic-left");
+}
+
+// Stop mid-assessment. Saves whatever was recorded (if anything beyond practice)
+// so symptom-limited runs are not lost, and asks for an after rating.
+function dvaStop(reason = "stopped") {
+  const d = state.dva;
+  dvaCancelScheduled();
+  const recorded = d.trialLog.some(t => t.phase !== "practice");
+  if (!recorded) { resetDvaAssessment(); return; }
+  d.phase = "stopped";
+  d.trialState = "idle";
+  optoMesh.visible = false;
+  paintInfo(["Assessment stopped and saved.", "Take a rest before doing more."]);
+  saveDvaRun(reason);
+  updateDvaUi("Assessment stopped and saved. Rate how you feel now.");
 }
 
 function showDvaResultPanel(rightLoss, leftLoss) {
@@ -1238,6 +1319,11 @@ bindSlider("ctl-ospeed", "val-ospeed", v => v.toFixed(2), v => state.optokinetic
 document.getElementById("dva-start").addEventListener("click", dvaStartAssessment);
 document.getElementById("dva-reset").addEventListener("click", resetDvaAssessment);
 document.getElementById("dva-export").addEventListener("click", exportDvaRuns);
+document.getElementById("dva-continue").addEventListener("click", dvaContinueFromRest);
+document.getElementById("dva-stop").addEventListener("click", () => dvaStop());
+document.getElementById("dva-save-after").addEventListener("click", saveDvaSymptomsAfter);
+bindSlider("dva-symptom-before", "val-dva-symptom-before", v => `${v.toFixed(0)} / 10`, () => {});
+bindSlider("dva-symptom-after", "val-dva-symptom-after", v => `${v.toFixed(0)} / 10`, () => {});
 document.getElementById("dva-back").addEventListener("click", () => { resetDvaAssessment(); setExerciseMode("fixation"); });
 document.querySelectorAll("[data-dva-response]").forEach(btn => btn.addEventListener("click", () => dvaRespond(Number(btn.dataset.dvaResponse))));
 document.getElementById("dva-not-seen").addEventListener("click", () => dvaRespond(null, "not_seen"));
@@ -1246,6 +1332,7 @@ document.getElementById("dva-not-seen").addEventListener("click", () => dvaRespo
 // gapDir mapping: 0=Right, 1=Up, 2=Left, 3=Down
 let stickReleased = true;
 let notSeenReleased = true;
+let continueReleased = true;
 function pollControllers() {
   if (!renderer.xr.isPresenting) return;
   const session = renderer.xr.getSession();
@@ -1261,6 +1348,14 @@ function pollControllers() {
         stickReleased = false;
         dvaStartAssessment();
       }
+      continue;
+    }
+
+    if (state.mode === "dva" && state.dva.phase === "rest") {
+      if (!gp.buttons[0]?.pressed) continueReleased = true;
+      else if (continueReleased) { continueReleased = false; stickReleased = false; dvaContinueFromRest(); continue; }
+      if (!gp.buttons[1]?.pressed) notSeenReleased = true;
+      else if (notSeenReleased) { notSeenReleased = false; dvaStop(); }
       continue;
     }
 
@@ -1297,6 +1392,7 @@ window.addEventListener("keydown", (e) => {
     dvaStartAssessment();
     e.preventDefault(); return;
   }
+  if (e.key === "Enter" && state.dva.phase === "rest") { dvaContinueFromRest(); e.preventDefault(); return; }
   const map = { ArrowRight: 0, ArrowUp: 1, ArrowLeft: 2, ArrowDown: 3 };
   if (e.key.toLowerCase() === "x") { dvaRespond(null, "not_seen"); e.preventDefault(); return; }
   if (e.key in map) { dvaRespond(map[e.key]); e.preventDefault(); }
@@ -1378,7 +1474,7 @@ enterBtn.addEventListener("click", async () => {
     exitBar.classList.add("visible");
     state.sessionStart = performance.now();
     if (state.mode === "dva") {
-      state.dva.phase = "idle";
+      resetDvaAssessment();
       paintInfo(["DVA test", "Press any controller button to begin"]);
       infoMesh.position.set(0, 1.15, -state.dva.dist);
       infoMesh.visible = true;
@@ -1400,7 +1496,11 @@ function onSessionEnd() {
   hud.classList.remove("visible");
   exitBar.classList.remove("visible");
   state.sessionStart = null;
-  resetDvaAssessment();
+  // Keep finished results on screen; save anything recorded in an unfinished run.
+  const phase = state.dva.phase;
+  if (phase === "done" || phase === "stopped") { dvaCancelScheduled(); optoMesh.visible = false; infoMesh.visible = false; }
+  else if (phase === "idle" || phase === "practice") resetDvaAssessment();
+  else { dvaStop("exited_vr"); infoMesh.visible = false; }
 }
 </script>
 </body>
