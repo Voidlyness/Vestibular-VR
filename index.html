@@ -730,20 +730,37 @@ function placeOptotype() {
 // ---------- head angular velocity tracking ----------
 let prevYaw = null;
 let headVelDeg = 0; // smoothed |yaw velocity| in deg/s
-let headYawVelDeg = 0; // signed yaw velocity, used to separate right/left DVA blocks
+let headYawVelDeg = 0; // signed yaw velocity (+ = rightward), used to separate right/left DVA blocks
 const _fwd = new THREE.Vector3();
 function updateHeadVelocity(dt) {
   camera.getWorldDirection(_fwd);
+  // atan2(x, z) decreases as the head turns right, so negate the delta to make rightward positive.
   const yaw = Math.atan2(_fwd.x, _fwd.z);
   if (prevYaw !== null && dt > 0) {
     let dYaw = yaw - prevYaw;
     while (dYaw > Math.PI) dYaw -= Math.PI * 2;
     while (dYaw < -Math.PI) dYaw += Math.PI * 2;
-    const signedInst = dYaw / dt * (180 / Math.PI);
+    const signedInst = -dYaw / dt * (180 / Math.PI);
     headYawVelDeg = headYawVelDeg * 0.7 + signedInst * 0.3;
     headVelDeg = Math.abs(headYawVelDeg);
   }
   prevYaw = yaw;
+}
+
+// Angular offset (degrees) between where the head points and the DVA optotype,
+// split into horizontal and vertical components.
+const _camPos = new THREE.Vector3();
+const _toTarget = new THREE.Vector3();
+function optotypeGazeOffsetDeg() {
+  camera.getWorldPosition(_camPos);
+  camera.getWorldDirection(_fwd);
+  _toTarget.copy(optoMesh.position).sub(_camPos).normalize();
+  const toDeg = 180 / Math.PI;
+  let yawOff = Math.atan2(_toTarget.x, _toTarget.z) - Math.atan2(_fwd.x, _fwd.z);
+  while (yawOff > Math.PI) yawOff -= Math.PI * 2;
+  while (yawOff < -Math.PI) yawOff += Math.PI * 2;
+  const pitchOff = Math.asin(THREE.MathUtils.clamp(_toTarget.y, -1, 1)) - Math.asin(THREE.MathUtils.clamp(_fwd.y, -1, 1));
+  return { yaw: Math.abs(yawOff) * toDeg, pitch: Math.abs(pitchOff) * toDeg };
 }
 
 // ---------- DVA staircase / trial engine ----------
@@ -752,6 +769,10 @@ const DVA_MAX_REVERSALS = 6;
 const DVA_MAX_TRIALS_PER_PHASE = 30;
 const DVA_START_LOGMAR = 1.0;  // gap = 10 arcmin (large)
 const DVA_FLOOR = -0.3, DVA_CEIL = 1.3;
+// Only flash when the head points close to the optotype, so it is actually in view.
+// Vertical tolerance is looser to allow for seated users and eye-height differences.
+const DVA_MAX_YAW_OFFSET_DEG = 10;
+const DVA_MAX_PITCH_OFFSET_DEG = 15;
 const DVA_STORAGE_KEY = "vestibular-vr-lab-dva-runs-v1";
 
 function saveDvaRun() {
@@ -835,7 +856,7 @@ function dvaStartPhase(phase) {
   } else {
     const side = phase === "dynamic-right" ? "right" : "left";
     paintInfo([`Dynamic ${side} — turn your head ${side}`, "Flash appears only in the velocity window"]);
-    updateDvaUi(`Move your head ${side}. The target will flash only at 120–180°/s.`);
+    updateDvaUi(`Sweep your head ${side} across the target. It flashes only at 120–180°/s while roughly straight ahead.`);
   }
   infoMesh.visible = true;
 }
@@ -848,6 +869,7 @@ function nextTrial(showNow) {
     d.trialState = "await";
     d.trialStartedAt = performance.now();
     d.stimulusVelocity = 0;
+    d.stimulusOffset = null;
     optoMesh.visible = true;
   } else {
     d.trialState = "waiting"; // wait for velocity window
@@ -862,7 +884,7 @@ function dvaRespond(dir, responseType = "direction") {
   if (d.trialState !== "await") return;
   const correct = responseType === "direction" && dir === d.gapDir;
   const reactionMs = Math.round(performance.now() - d.trialStartedAt);
-  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, responseType, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), movementDirection: d.movementDirection });
+  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, responseType, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), stimulusGazeOffsetDeg: d.stimulusOffset ? { yaw: Number(d.stimulusOffset.yaw.toFixed(1)), pitch: Number(d.stimulusOffset.pitch.toFixed(1)) } : null, movementDirection: d.movementDirection });
   d.trialsInPhase += 1;
   if (d.phase === "practice") {
     d.practiceRemaining -= 1;
@@ -1035,21 +1057,27 @@ function animateDva(nowMs, dt) {
     if (d.metro && nowMs - lastTick > 600) { metroTick(); lastTick = nowMs; }
 
     if (d.trialState === "waiting") {
-      const inWindow = headVelDeg >= (d.velTarget - d.velTol) &&
-                       headVelDeg <= (d.velTarget + d.velTol) &&
-                       Math.sign(headYawVelDeg || d.movementDirection) === d.movementDirection;
+      const speedOk = headVelDeg >= (d.velTarget - d.velTol) &&
+                      headVelDeg <= (d.velTarget + d.velTol) &&
+                      Math.sign(headYawVelDeg) === d.movementDirection;
+      const offset = optotypeGazeOffsetDeg();
+      const onTarget = offset.yaw <= DVA_MAX_YAW_OFFSET_DEG && offset.pitch <= DVA_MAX_PITCH_OFFSET_DEG;
+      const inWindow = speedOk && onTarget;
       const readiness = document.getElementById("dva-readiness");
       const directionText = d.movementDirection === 1 ? "right" : "left";
       readiness.classList.toggle("ready", inWindow);
       readiness.textContent = inWindow
         ? `Ready — ${Math.round(headVelDeg)}°/s. Flashing now.`
-        : `Move ${directionText}: ${Math.round(headVelDeg)}°/s (target 120–180°/s).`;
+        : speedOk
+          ? `Speed OK (${Math.round(headVelDeg)}°/s) — sweep ${directionText} across the target so it is straight ahead.`
+          : `Move ${directionText} across the target: ${Math.round(headVelDeg)}°/s (target 120–180°/s).`;
       if (inWindow) {
         optoMesh.visible = true;
         d.trialState = "flash";
         d.flashUntil = nowMs + 150; // brief exposure only
         d.trialStartedAt = nowMs;
         d.stimulusVelocity = headVelDeg;
+        d.stimulusOffset = offset;
       }
     } else if (d.trialState === "flash") {
       if (nowMs >= d.flashUntil) {
