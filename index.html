@@ -401,7 +401,8 @@ function newSessionRecord() {
     },
     device: { userAgent: navigator.userAgent, xrActive: renderer?.xr?.isPresenting || false },
     settings: JSON.parse(JSON.stringify({
-      fixation: state.fixation, pursuit: state.pursuit, optokinetic: state.optokinetic, dva: state.dva,
+      fixation: state.fixation, pursuit: state.pursuit, optokinetic: state.optokinetic,
+      dva: { dist: state.dva.dist, velTarget: state.dva.velTarget, velTol: state.dva.velTol, metro: state.dva.metro },
     })),
     events: [],
     headMotion: { sampleRateHz: 2, samples: [] },
@@ -773,6 +774,7 @@ const DVA_FLOOR = -0.3, DVA_CEIL = 1.3;
 // Vertical tolerance is looser to allow for seated users and eye-height differences.
 const DVA_MAX_YAW_OFFSET_DEG = 10;
 const DVA_MAX_PITCH_OFFSET_DEG = 15;
+const DVA_RESPONSE_TIMEOUT_MS = 4000;
 const DVA_STORAGE_KEY = "vestibular-vr-lab-dva-runs-v1";
 
 function saveDvaRun() {
@@ -813,8 +815,21 @@ function updateDvaUi(message) {
   for (let i = 0; i < 5; i++) document.getElementById(`dva-step-${i}`).className = i < step ? "done" : i === step ? "active" : "";
 }
 
+// All delayed DVA steps go through one timer so Reset, Back and leaving VR
+// can cancel a pending phase/trial change.
+let dvaTimer = null;
+function dvaSchedule(fn, ms) {
+  clearTimeout(dvaTimer);
+  dvaTimer = setTimeout(() => { dvaTimer = null; fn(); }, ms);
+}
+function dvaCancelScheduled() {
+  clearTimeout(dvaTimer);
+  dvaTimer = null;
+}
+
 function dvaStartAssessment() {
   const d = state.dva;
+  dvaCancelScheduled();
   d.staticThreshold = null;
   d.dynamicThresholds = { right: null, left: null };
   d.trialLog = [];
@@ -824,6 +839,7 @@ function dvaStartAssessment() {
 
 function resetDvaAssessment() {
   const d = state.dva;
+  dvaCancelScheduled();
   d.phase = "idle";
   d.trialState = "idle";
   d.reversals = [];
@@ -884,13 +900,13 @@ function dvaRespond(dir, responseType = "direction") {
   if (d.trialState !== "await") return;
   const correct = responseType === "direction" && dir === d.gapDir;
   const reactionMs = Math.round(performance.now() - d.trialStartedAt);
-  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, responseType, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), stimulusGazeOffsetDeg: d.stimulusOffset ? { yaw: Number(d.stimulusOffset.yaw.toFixed(1)), pitch: Number(d.stimulusOffset.pitch.toFixed(1)) } : null, movementDirection: d.movementDirection });
+  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: dir, responseType, correct, reactionMs, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), stimulusGazeOffsetDeg: roundedOffset(d.stimulusOffset), movementDirection: d.movementDirection });
   d.trialsInPhase += 1;
   if (d.phase === "practice") {
     d.practiceRemaining -= 1;
     optoMesh.visible = false;
-    if (d.practiceRemaining <= 0) setTimeout(() => dvaStartPhase("static"), 600);
-    else setTimeout(() => nextTrial(true), 350);
+    if (d.practiceRemaining <= 0) dvaSchedule(() => dvaStartPhase("static"), 600);
+    else dvaSchedule(() => nextTrial(true), 350);
     updateDvaUi(`${Math.max(0, d.practiceRemaining)} practice trial${d.practiceRemaining === 1 ? "" : "s"} remaining.`);
     return;
   }
@@ -907,8 +923,24 @@ function dvaRespond(dir, responseType = "direction") {
   if (d.reversals.length >= DVA_MAX_REVERSALS || d.trialsInPhase >= DVA_MAX_TRIALS_PER_PHASE) {
     finishPhase();
   } else {
-    setTimeout(() => nextTrial(true), 350);
+    dvaSchedule(() => nextTrial(true), 350);
   }
+}
+
+// No answer within the response window. Logged and counted towards the phase
+// trial cap (so the block always ends) but not fed to the staircase.
+function roundedOffset(o) {
+  return o ? { yaw: Number(o.yaw.toFixed(1)), pitch: Number(o.pitch.toFixed(1)) } : null;
+}
+
+function dvaTimeout() {
+  const d = state.dva;
+  d.trialLog.push({ phase: d.phase, logMAR: Number(d.logMAR.toFixed(2)), gapDirection: d.gapDir, response: null, responseType: "timeout", correct: null, reactionMs: null, stimulusVelocityDegPerSec: Math.round(d.stimulusVelocity || 0), stimulusGazeOffsetDeg: roundedOffset(d.stimulusOffset), movementDirection: d.movementDirection });
+  d.trialsInPhase += 1;
+  d.trialState = "idle";
+  if (d.trialsInPhase >= DVA_MAX_TRIALS_PER_PHASE) { finishPhase(); return; }
+  nextTrial(true);
+  updateDvaUi("No response recorded; prepare for the next flash.");
 }
 
 function finishPhase() {
@@ -918,11 +950,11 @@ function finishPhase() {
   if (d.phase === "static") {
     d.staticThreshold = threshold;
     paintInfo(["Baseline complete.", "Next: rightward head movement"]);
-    setTimeout(() => dvaStartPhase("dynamic-right"), 1200);
+    dvaSchedule(() => dvaStartPhase("dynamic-right"), 1200);
   } else if (d.phase === "dynamic-right") {
     d.dynamicThresholds.right = threshold;
     paintInfo(["Rightward block complete.", "Next: leftward head movement"]);
-    setTimeout(() => dvaStartPhase("dynamic-left"), 1200);
+    dvaSchedule(() => dvaStartPhase("dynamic-left"), 1200);
   } else if (d.phase === "dynamic-left") {
     d.dynamicThresholds.left = threshold;
     d.phase = "done";
@@ -971,7 +1003,6 @@ function applyMode() {
 applyMode();
 
 // ---------- per-frame animation ----------
-const clock = new THREE.Clock();
 let pursuitJumpTimer = 0;
 let pursuitJumpTarget = new THREE.Vector2(0, 0);
 
@@ -980,7 +1011,7 @@ function animateFixation() {
   targetGroup.position.set(0, 1.6, -d);
 }
 
-function animatePursuit(t) {
+function animatePursuit(t, dt) {
   const d = TRAINING_TARGET_DISTANCE;
   const ampRad = (state.pursuit.amp * Math.PI) / 180;
   const sp = state.pursuit.speed;
@@ -996,12 +1027,9 @@ function animatePursuit(t) {
       x = Math.sin(t * sp * Math.PI * 2) * Math.sin(ampRad) * d;
       y = Math.cos(t * sp * Math.PI * 2) * Math.sin(ampRad) * d * 0.6;
       break;
-    case "random":
-      pursuitJumpTimer -= clock.getDelta() * 0 + (1/60); // approx, corrected below
-      break;
   }
   if (state.pursuit.path === "random") {
-    pursuitJumpTimer -= 1 / 60;
+    pursuitJumpTimer -= dt;
     if (pursuitJumpTimer <= 0) {
       pursuitJumpTimer = 0.9 / Math.max(sp, 0.1);
       pursuitJumpTarget.set(
@@ -1087,7 +1115,7 @@ function animateDva(nowMs, dt) {
         updateDvaUi("Answer the gap orientation now.");
       }
     } else if (d.trialState === "await") {
-      if (nowMs - d.awaitSince > 4000) { d.trialState = "waiting"; updateDvaUi("No response recorded; prepare for the next flash."); }
+      if (nowMs - d.awaitSince > DVA_RESPONSE_TIMEOUT_MS) dvaTimeout();
     }
   }
 }
@@ -1122,7 +1150,7 @@ renderer.setAnimationLoop((time) => {
   updateGuidedSession(time);
 
   if (state.mode === "fixation") animateFixation();
-  else if (state.mode === "pursuit") animatePursuit(t);
+  else if (state.mode === "pursuit") animatePursuit(t, dt);
   else if (state.mode === "optokinetic") animateOptokinetic(dt);
   else if (state.mode === "dva") animateDva(time, dt);
 
@@ -1228,7 +1256,11 @@ function pollControllers() {
 
     // Start the test with any main button while idle
     if (state.mode === "dva" && state.dva.phase === "idle") {
-      if (gp.buttons.some(b => b && b.pressed)) dvaStartAssessment();
+      if (gp.buttons.some(b => b && b.pressed)) {
+        notSeenReleased = false;
+        stickReleased = false;
+        dvaStartAssessment();
+      }
       continue;
     }
 
@@ -1368,9 +1400,7 @@ function onSessionEnd() {
   hud.classList.remove("visible");
   exitBar.classList.remove("visible");
   state.sessionStart = null;
-  state.dva.phase = "idle";
-  optoMesh.visible = false;
-  infoMesh.visible = false;
+  resetDvaAssessment();
 }
 </script>
 </body>
