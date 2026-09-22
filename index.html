@@ -361,6 +361,9 @@ const state = {
     lastDir: 0,          // last staircase step direction (+down/-up)
     staticThreshold: null,
     dynamicThresholds: { right: null, left: null },
+    floor: 0,            // smallest logMAR the display can render (set per phase)
+    floorHits: 0,        // "harder" steps that tried to go below the floor
+    atLimit: { static: false, right: false, left: false },
     practiceRemaining: 0,
     movementDirection: null,
     trialLog: [],
@@ -787,7 +790,12 @@ const DVA_MAX_REVERSALS = 6;
 // 2-down/1-up, which converges on ~71% correct (4AFC chance is 25%).
 const DVA_MAX_TRIALS_PER_PHASE = 40;
 const DVA_START_LOGMAR = 1.0;  // gap = 10 arcmin (large)
-const DVA_FLOOR = -0.3, DVA_CEIL = 1.3;
+const DVA_CEIL = 1.3;
+// The C's gap must span at least this many display pixels to be resolvable at all;
+// below that the staircase measures the headset, not the eye.
+const DVA_MIN_GAP_PX = 2;
+const DVA_FALLBACK_PPD = 20;   // Quest-class headsets are ~20-25 px/deg
+const DVA_FLOOR_HITS_TO_STOP = 3;
 // Only flash when the head points close to the optotype, so it is actually in view.
 // Vertical tolerance is looser to allow for seated users and eye-height differences.
 const DVA_MAX_YAW_OFFSET_DEG = 10;
@@ -805,6 +813,7 @@ function saveDvaRun(outcome) {
     velocityWindowDegPerSec: [d.velTarget - d.velTol, d.velTarget + d.velTol],
     symptoms: { before: d.symptomsBefore, after: null },
     staticLogMAR: d.staticThreshold, dynamicLogMAR: d.dynamicThresholds,
+    displayFloorLogMAR: d.floor, atDisplayLimit: d.atLimit,
     trialLog: d.trialLog,
     eyeTracking: { available: false, integrationStatus: "not connected" },
   };
@@ -871,6 +880,7 @@ function dvaStartAssessment() {
   dvaCancelScheduled();
   d.staticThreshold = null;
   d.dynamicThresholds = { right: null, left: null };
+  d.atLimit = { static: false, right: false, left: false };
   d.trialLog = [];
   d.symptomsBefore = Number(document.getElementById("dva-symptom-before").value);
   d.runId = null;
@@ -897,10 +907,37 @@ function resetDvaAssessment() {
   updateDvaUi("Practice first, then static acuity, followed by separate rightward and leftward head-movement blocks. This prototype records performance; it does not diagnose vestibular dysfunction.");
 }
 
+// Pixels per degree at the centre of the view, from the current projection and buffer size.
+function displayPixelsPerDegree() {
+  let e, widthPx;
+  if (renderer.xr.isPresenting) {
+    const eye = renderer.xr.getCamera().cameras[0];
+    const layer = renderer.xr.getSession()?.renderState.baseLayer;
+    if (!eye || !layer) return DVA_FALLBACK_PPD;
+    e = eye.projectionMatrix.elements;
+    widthPx = layer.framebufferWidth / 2; // side-by-side stereo buffer
+  } else {
+    e = camera.projectionMatrix.elements;
+    widthPx = renderer.domElement.width;
+  }
+  // NDC x = e[0]*tan(angle) + e[8]; NDC spans 2 across widthPx.
+  const ppd = (widthPx * e[0] / 2) * (Math.PI / 180);
+  return isFinite(ppd) && ppd > 0 ? ppd : DVA_FALLBACK_PPD;
+}
+
+// Smallest logMAR the display can render, rounded up onto the 0.1 staircase grid.
+function dvaFloorLogMAR() {
+  const gapArcmin = DVA_MIN_GAP_PX * 60 / displayPixelsPerDegree();
+  const floor = Math.ceil(Math.log10(gapArcmin) / DVA_STEP - 1e-9) * DVA_STEP;
+  return Math.min(Math.round(floor * 100) / 100, DVA_CEIL);
+}
+
 function dvaStartPhase(phase) {
   const d = state.dva;
   d.phase = phase;
-  d.logMAR = DVA_START_LOGMAR;
+  d.floor = dvaFloorLogMAR();
+  d.floorHits = 0;
+  d.logMAR = Math.max(DVA_START_LOGMAR, d.floor);
   d.reversals = [];
   d.lastDir = 0;
   d.correctStreak = 0;
@@ -967,12 +1004,15 @@ function dvaRespond(dir, responseType = "direction") {
     if (d.lastDir !== 0 && step !== d.lastDir) d.reversals.push(d.logMAR);
     d.lastDir = step;
     d.logMAR = Math.round((d.logMAR - step * DVA_STEP) * 100) / 100;
-    d.logMAR = Math.max(DVA_FLOOR, Math.min(DVA_CEIL, d.logMAR));
+    if (d.logMAR < d.floor) d.floorHits += 1;
+    d.logMAR = Math.max(d.floor, Math.min(DVA_CEIL, d.logMAR));
   }
   optoMesh.visible = false;
   updateDvaUi("Preparing the next trial.");
 
-  if (d.reversals.length >= DVA_MAX_REVERSALS || d.trialsInPhase >= DVA_MAX_TRIALS_PER_PHASE) {
+  // Repeatedly correct at the display floor: the staircase can't go lower, so stop there.
+  if (d.reversals.length >= DVA_MAX_REVERSALS || d.trialsInPhase >= DVA_MAX_TRIALS_PER_PHASE ||
+      d.floorHits >= DVA_FLOOR_HITS_TO_STOP) {
     finishPhase();
   } else {
     dvaSchedule(() => nextTrial(true), 350);
@@ -997,8 +1037,15 @@ function dvaTimeout() {
 
 function finishPhase() {
   const d = state.dva;
+  d.trialState = "idle"; // ignore responses until the next phase starts
   const last4 = d.reversals.slice(-4);
-  const threshold = last4.length ? last4.reduce((a, b) => a + b, 0) / last4.length : d.logMAR;
+  const atFloor = d.floorHits >= DVA_FLOOR_HITS_TO_STOP;
+  const threshold = atFloor ? d.floor
+    : last4.length ? last4.reduce((a, b) => a + b, 0) / last4.length : d.logMAR;
+  const limited = d.floorHits > 0; // the staircase wanted to go smaller than the display allows
+  if (d.phase === "static") d.atLimit.static = limited;
+  else if (d.phase === "dynamic-right") d.atLimit.right = limited;
+  else if (d.phase === "dynamic-left") d.atLimit.left = limited;
   if (d.phase === "static") {
     d.staticThreshold = threshold;
     paintInfo(["Baseline complete.", "Next: rightward head movement"]);
@@ -1015,6 +1062,7 @@ function finishPhase() {
     paintInfo([
       `Static ${d.staticThreshold.toFixed(2)} logMAR`,
       `Right ${rightLoss >= 0 ? "+" : ""}${rightLoss.toFixed(2)} · Left ${leftLoss >= 0 ? "+" : ""}${leftLoss.toFixed(2)} logMAR loss`,
+      ...(d.atLimit.static ? ["(baseline hit headset resolution limit)"] : []),
     ]);
     showDvaResultPanel(rightLoss, leftLoss);
     saveDvaRun("complete");
@@ -1061,8 +1109,22 @@ function showDvaResultPanel(rightLoss, leftLoss) {
     `<strong>Results</strong><br/>Static: ${d.staticThreshold.toFixed(2)} logMAR<br/>` +
     `Rightward loss: <strong>${rightLoss >= 0 ? "+" : ""}${rightLoss.toFixed(2)}</strong> logMAR · ` +
     `Leftward loss: <strong>${leftLoss >= 0 ? "+" : ""}${leftLoss.toFixed(2)}</strong> logMAR<br/>` +
-    `${valid} recorded trials. Treat this as a repeatable research/progress measure, not a diagnostic result.`;
-  console.log("[DVA]", { static: d.staticThreshold, ...d.dynamicThresholds, rightLoss, leftLoss, trials: d.trialLog });
+    `${valid} recorded trials. Treat this as a repeatable research/progress measure, not a diagnostic result.` +
+    dvaResolutionNote(d);
+  console.log("[DVA]", { static: d.staticThreshold, ...d.dynamicThresholds, rightLoss, leftLoss, floor: d.floor, atLimit: d.atLimit, trials: d.trialLog });
+}
+
+function dvaResolutionNote(d) {
+  if (!d.atLimit.static) return "";
+  const floor = d.floor.toFixed(2);
+  const capped = [d.atLimit.right && "rightward", d.atLimit.left && "leftward"].filter(Boolean);
+  let note = `<br/><strong>Resolution limit:</strong> the static baseline reached the smallest C this headset can show ` +
+    `(${floor} logMAR), so your true baseline may be better and the losses are likely <em>under</em>estimated.`;
+  if (capped.length) {
+    note += ` The ${capped.join(" and ")} score${capped.length > 1 ? "s" : ""} also reached the limit, so a loss near 0 there means ` +
+      `"no measurable loss at this resolution", not "no loss".`;
+  }
+  return note;
 }
 
 // ---------- mode visibility ----------
